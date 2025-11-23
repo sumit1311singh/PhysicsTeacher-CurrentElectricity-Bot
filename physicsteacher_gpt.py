@@ -10,6 +10,7 @@ Original file is located at
 ! pip install PyPDF2
 ! pip install chromadb
 ! pip install tavily
+! pip install nemoguardrails
 
 from openai import OpenAI
 import gradio as gr
@@ -17,6 +18,7 @@ import os
 import PyPDF2
 import chromadb
 from dotenv import load_dotenv
+load_dotenv()
 import requests
 from urllib.parse import urlparse
 import re
@@ -29,8 +31,34 @@ load_dotenv()
 from openai import OpenAI
 client = OpenAI(api_key="")
 
+# LangSmith imports with error handling
+os.environ["LANGCHAIN_API_KEY"] = ""  #Add your LANGCHAIN API Key
+try:
+    import langsmith
+    from langsmith import traceable
+    LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
+    if LANGCHAIN_API_KEY:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = "physics-teacher-bot"
+        langsmith_client = langsmith.Client()
+        LANGCHAIN_AVAILABLE = True
+        print("✅ LangSmith tracing initialized successfully!")
+    else:
+        print("⚠️  LANGCHAIN_API_KEY not found. LangSmith tracing will be disabled.")
+        langsmith_client = None
+        LANGCHAIN_AVAILABLE = False
+except ImportError:
+    print("⚠️  LangSmith not installed. Tracing will be disabled.")
+    print("💡 Run: pip install langsmith")
+    langsmith_client = None
+    LANGCHAIN_AVAILABLE = False
+except Exception as e:
+    print(f"⚠️  LangSmith initialization failed: {e}")
+    langsmith_client = None
+    LANGCHAIN_AVAILABLE = False
+
 # Initialize Tavily client with error handling
-os.environ["TAVILY_API_KEY"] = "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"
+os.environ["TAVILY_API_KEY"] = ""  #Add your TAVILY API Key
 try:
     from tavily import TavilyClient
     tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
@@ -40,11 +68,145 @@ except ImportError:
     print("⚠️  Tavily not installed. Web search functionality will be disabled.")
     print("💡 Run: pip install tavily-python")
 
+# Initialize NVIDIA NeMo Guardrails with error handling
+try:
+    from nemoguardrails import RailsConfig, LLMRails
+    from nemoguardrails.actions import action
+    NEMO_GUARDRAILS_AVAILABLE = True
+except ImportError:
+    NEMO_GUARDRAILS_AVAILABLE = False
+    print("⚠️  NVIDIA NeMo Guardrails not installed. Safety features will be disabled.")
+    print("💡 Run: pip install nemoguardrails")
+
 # Initialize ChromaDB
 chroma_client = chromadb.Client()
 pdf_collection = chroma_client.create_collection(name="PhysicsPDFs")
 memory_collection = chroma_client.create_collection(name="ConversationMemory")
 
+# Initialize NeMo Guardrails if available
+nemo_rails = None
+if NEMO_GUARDRAILS_AVAILABLE:
+    try:
+        # Define complete guardrails configuration
+        guardrails_config = """
+models:
+  - type: main
+    engine: openai
+    model: gpt-3.5-turbo
+
+rails:
+  input:
+    flows:
+      - self check input
+      - check jailbreak
+      - detect sensitive topics
+  output:
+    flows:
+      - self check output
+      - check for pii
+      - ensure appropriate tone
+
+instructions:
+  - type: general
+    content: |
+      You are a physics teaching assistant. Always provide accurate, educational,
+      and safe responses. Focus on physics concepts and related scientific topics.
+      Avoid harmful, dangerous, or inappropriate content.
+
+prompts:
+  - task: self_check_input
+    content: |
+      Check if the following user message is safe and appropriate for a physics education context.
+      Consider if it contains any harmful, dangerous, illegal, or inappropriate content.
+      Focus on educational physics topics.
+
+      User message: {{user_input}}
+
+      Is this message safe and appropriate? Answer with YES or NO only.
+
+  - task: self_check_output
+    content: |
+      Check if the following bot response is safe, appropriate, and follows the guidelines for a physics education context.
+      The response should be educational, accurate, and avoid any harmful or inappropriate content.
+
+      Bot response: {{bot_response}}
+
+      Is this response safe and appropriate? Answer with YES or NO only.
+
+  - task: general
+    content: |
+      You are a physics teaching assistant. Provide accurate, educational, and safe responses.
+      Focus on physics concepts and related scientific topics.
+      If asked about harmful, dangerous, or inappropriate topics, politely decline and redirect to educational physics topics.
+        """
+
+        config = RailsConfig.from_content(guardrails_config)
+        nemo_rails = LLMRails(config)
+
+        # Register custom actions
+        @action
+        def check_physics_context():
+            return True
+
+        @action
+        def validate_educational_content():
+            return True
+
+        nemo_rails.register_action(check_physics_context)
+        nemo_rails.register_action(validate_educational_content)
+
+        print("✅ NVIDIA NeMo Guardrails initialized successfully!")
+
+    except Exception as e:
+        print(f"❌ Error initializing NeMo Guardrails: {e}")
+        NEMO_GUARDRAILS_AVAILABLE = False
+
+class TokenUsageTracker:
+    """Track token usage across different components"""
+
+    def __init__(self):
+        self.total_tokens = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.costs = 0.0
+
+    def update_from_response(self, response, model="gpt-3.5-turbo"):
+        """Update token counts from OpenAI response"""
+        if hasattr(response, 'usage'):
+            usage = response.usage
+            self.prompt_tokens += getattr(usage, 'prompt_tokens', 0)
+            self.completion_tokens += getattr(usage, 'completion_tokens', 0)
+            self.total_tokens += getattr(usage, 'total_tokens', 0)
+
+            # Calculate cost (approximate)
+            cost_rates = {
+                "gpt-3.5-turbo": (0.0015, 0.002),  # $0.0015/1K input, $0.002/1K output
+                "gpt-4": (0.03, 0.06),  # $0.03/1K input, $0.06/1K output
+                "gpt-4-turbo": (0.01, 0.03)  # $0.01/1K input, $0.03/1K output
+            }
+
+            input_rate, output_rate = cost_rates.get(model, (0.0015, 0.002))
+            self.costs += (self.prompt_tokens / 1000 * input_rate) + (self.completion_tokens / 1000 * output_rate)
+
+    def get_summary(self):
+        """Get token usage summary"""
+        return {
+            "total_tokens": self.total_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "estimated_cost": round(self.costs, 4)
+        }
+
+# Global token tracker
+token_tracker = TokenUsageTracker()
+
+def traceable_function(func):
+    """Decorator that conditionally applies tracing based on availability"""
+    if LANGCHAIN_AVAILABLE:
+        return traceable(func)
+    return func
+
+@traceable_function
 def extract_text_from_pdf(pdf_path):
     """Extract text from PDF file"""
     with open(pdf_path, 'rb') as file:
@@ -54,6 +216,7 @@ def extract_text_from_pdf(pdf_path):
             text += page.extract_text() + "\n"
     return text
 
+@traceable_function
 def chunk_text(text, chunk_size=1000):
     """Split text into chunks"""
     words = text.split()
@@ -63,6 +226,7 @@ def chunk_text(text, chunk_size=1000):
         chunks.append(chunk)
     return chunks
 
+@traceable_function
 def store_pdf_in_db(pdf_path):
     """Extract, chunk and store PDF in ChromaDB"""
     try:
@@ -70,21 +234,35 @@ def store_pdf_in_db(pdf_path):
         chunks = chunk_text(text)
 
         # Clear existing data
-        pdf_collection.delete(where={"source": {"$ne": ""}})  # Delete all documents
+        pdf_collection.delete(where={"source": {"$ne": ""}})
 
         # Add chunks to ChromaDB
         for i, chunk in enumerate(chunks):
             pdf_collection.add(
                 documents=[chunk],
-                metadatas=[{"source": pdf_path, "chunk_id": i}],
-                ids=[f"chunk_{i}_{os.path.basename(pdf_path)}"]
+                metadatas=[{"source": pdf_path, "chunk_id": i, "type": "pdf"}],
+                ids=[f"pdf_chunk_{i}_{os.path.basename(pdf_path)}"]
             )
+
+        # Log to LangSmith
+        if langsmith_client:
+            try:
+                langsmith_client.create_feedback(
+                    run_id=None,  # Will be associated with current trace
+                    key="pdf_processing",
+                    score=1.0,
+                    comment=f"Processed {len(chunks)} chunks from {pdf_path}"
+                )
+            except Exception as e:
+                print(f"LangSmith logging error: {e}")
+
         return f"✅ Successfully loaded {len(chunks)} chunks from {pdf_path}"
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
+@traceable_function
 def get_relevant_context(query, n_results=3):
-    """Retrieve relevant context from ChromaDB"""
+    """Retrieve relevant context from PDF knowledge base"""
     try:
         results = pdf_collection.query(
             query_texts=[query],
@@ -92,9 +270,10 @@ def get_relevant_context(query, n_results=3):
         )
         return "\n\n".join(results['documents'][0]) if results['documents'] else ""
     except Exception as e:
-        print(f"ChromaDB query error: {e}")
+        print(f"PDF context query error: {e}")
         return ""
 
+@traceable_function
 def store_conversation_memory(user_message, bot_response, conversation_context=""):
     """Store conversation in long-term memory"""
     try:
@@ -126,6 +305,7 @@ def store_conversation_memory(user_message, bot_response, conversation_context="
         print(f"Memory storage error: {e}")
         return False
 
+@traceable_function
 def get_relevant_memories(query, n_results=2):
     """Retrieve relevant past conversations from memory"""
     try:
@@ -146,6 +326,7 @@ def get_relevant_memories(query, n_results=2):
         print(f"Memory retrieval error: {e}")
         return ""
 
+@traceable_function
 def get_conversation_summary(history):
     """Generate a summary of the current conversation context"""
     if not history:
@@ -167,6 +348,7 @@ def get_conversation_summary(history):
 
     return "\n".join(context_parts)
 
+@traceable_function
 def is_pdf_context_relevant(pdf_context, query):
     """Check if PDF context is actually relevant to the query"""
     if not pdf_context or len(pdf_context.strip()) < 50:
@@ -197,6 +379,7 @@ def is_pdf_context_relevant(pdf_context, query):
 
     return True
 
+@traceable_function
 def search_with_tavily(query):
     """Search using Tavily and get content from first result"""
     if not TAVILY_AVAILABLE:
@@ -232,7 +415,113 @@ def search_with_tavily(query):
     except Exception as e:
         return f"❌ Search error: {str(e)}"
 
+def apply_keyword_safety_check(user_message, bot_response):
+    """Fallback keyword-based safety check"""
+    harmful_keywords = [
+        "bomb", "weapon", "explosive", "harmful", "dangerous", "illegal",
+        "hack", "cheat", "bypass", "malicious", "violence", "hurt", "kill"
+    ]
+
+    user_lower = user_message.lower()
+    response_lower = bot_response.lower()
+
+    # Check for harmful content in user message
+    if any(keyword in user_lower for keyword in harmful_keywords):
+        safety_message = "I apologize, but I cannot engage with that type of question. I'm here to help with physics education and related scientific topics."
+        return safety_message, "🛡️ Input blocked by safety check"
+
+    # Check for harmful content in bot response
+    if any(keyword in response_lower for keyword in harmful_keywords):
+        safety_message = "I need to provide a safe and educational response. Let me rephrase that to focus on the educational aspects of physics."
+        return safety_message, "🛡️ Response moderated by safety check"
+
+    return bot_response, "🛡️ Safety check passed"
+
+@traceable_function
+def apply_safety_guardrails(user_message, bot_response):
+    """Apply NeMo Guardrails for safety and content filtering"""
+    if not NEMO_GUARDRAILS_AVAILABLE:
+        return bot_response, "⚠️ Guardrails disabled"
+
+    try:
+        # Use NeMo Guardrails for safety checking
+        guarded_response = nemo_rails.generate(
+            messages=[{"role": "user", "content": user_message}]
+        )
+
+        # If guardrails modified the response, use the guarded version
+        if guarded_response and guarded_response != bot_response:
+            return guarded_response, "🛡️ Response moderated by guardrails"
+
+        return bot_response, "🛡️ Safety check passed"
+
+    except Exception as e:
+        print(f"Guardrails error: {e}")
+        # Fallback to keyword-based safety check
+        return apply_keyword_safety_check(user_message, bot_response)
+
+@traceable_function
+def check_educational_context(user_message):
+    """Check if the query is appropriate for educational physics context"""
+    inappropriate_topics = [
+        "harmful", "dangerous", "illegal", "weapon", "explosive",
+        "hack", "cheat", "bypass", "circumvent", "malicious"
+    ]
+
+    user_lower = user_message.lower()
+
+    # Check for potentially harmful topics
+    for topic in inappropriate_topics:
+        if topic in user_lower:
+            return False, f"This appears to be asking about {topic} topics, which I cannot assist with for safety reasons."
+
+    # Check if it's physics-related or general educational
+    physics_terms = [
+        "physics", "quantum", "mechanics", "thermodynamics", "electromagnetism",
+        "relativity", "optics", "atomic", "nuclear", "particle", "force",
+        "energy", "motion", "velocity", "acceleration", "gravity", "electric",
+        "magnetic", "wave", "light", "sound", "heat", "temperature"
+    ]
+
+    # Allow general educational questions too
+    educational_terms = [
+        "science", "math", "chemistry", "biology", "astronomy", "engineering",
+        "technology", "computer", "programming", "learn", "study", "education",
+        "explain", "how does", "what is", "why does"
+    ]
+
+    has_physics_term = any(term in user_lower for term in physics_terms)
+    has_educational_term = any(term in user_lower for term in educational_terms)
+
+    if not (has_physics_term or has_educational_term):
+        return False, "I specialize in physics and educational topics. Please ask questions related to science, education, or general knowledge."
+
+    return True, "OK"
+
+@traceable_function
 def chat_with_physics_bot(message, history):
+    """Main chat function with comprehensive tracing and token tracking"""
+
+    # Create a unique run ID for this conversation
+    run_id = str(uuid.uuid4())
+
+    # Log conversation start
+    if langsmith_client:
+        try:
+            langsmith_client.create_feedback(
+                run_id=run_id,
+                key="conversation_start",
+                score=1.0,
+                comment=f"User message: {message[:100]}..."
+            )
+        except Exception as e:
+            print(f"LangSmith logging error: {e}")
+
+    # First check educational context
+    is_appropriate, context_message = check_educational_context(message)
+    if not is_appropriate:
+        return f"🛡️ Educational Context Check:\n\n{context_message}"
+
     # Get relevant context from different sources
     pdf_context = get_relevant_context(message)
     memory_context = get_relevant_memories(message)
@@ -246,7 +535,8 @@ def chat_with_physics_bot(message, history):
     2. If the context doesn't fully answer the question, use your knowledge to provide a complete answer
     3. Reference past conversations when relevant to provide continuity
     4. Be educational and clear in your explanations
-    5. Maintain context from the current conversation flow"""
+    5. Maintain context from the current conversation flow
+    6. Always prioritize safety and educational value in your responses"""
 
     # Build context sections
     context_sections = []
@@ -278,7 +568,7 @@ def chat_with_physics_bot(message, history):
 
 Question: {message}
 
-Please provide a helpful answer based on the available context above."""
+Please provide a helpful, educational answer based on the available context above."""
 
     try:
         response = client.chat.completions.create(
@@ -290,24 +580,82 @@ Please provide a helpful answer based on the available context above."""
             temperature=0.2
         )
 
+        # Track token usage
+        token_tracker.update_from_response(response, "gpt-3.5-turbo")
+
         bot_response = response.choices[0].message.content
 
-        # Store this conversation in long-term memory
-        store_conversation_memory(message, bot_response, conversation_context)
+        # Apply safety guardrails
+        safe_response, safety_status = apply_safety_guardrails(message, bot_response)
 
-        return f"🔮 Sources: {source_note}\n\n{bot_response}"
+        # Store this conversation in long-term memory (only if safe)
+        if "blocked" not in safety_status.lower():
+            store_conversation_memory(message, safe_response, conversation_context)
+
+        # Log token usage and success
+        if langsmith_client:
+            try:
+                token_summary = token_tracker.get_summary()
+                langsmith_client.create_feedback(
+                    run_id=run_id,
+                    key="token_usage",
+                    score=1.0,
+                    comment=json.dumps(token_summary)
+                )
+
+                langsmith_client.create_feedback(
+                    run_id=run_id,
+                    key="response_quality",
+                    score=1.0,
+                    comment=f"Sources: {source_note}, Safety: {safety_status}"
+                )
+            except Exception as e:
+                print(f"LangSmith logging error: {e}")
+
+        # Add token usage to response
+        token_summary = token_tracker.get_summary()
+        token_info = f" | Tokens: {token_summary['total_tokens']} (${token_summary['estimated_cost']})"
+
+        return f"🔮 Sources: {source_note} | {safety_status}{token_info}\n\n{safe_response}"
 
     except Exception as e:
+        # Log error to LangSmith
+        if langsmith_client:
+            try:
+                langsmith_client.create_feedback(
+                    run_id=run_id,
+                    key="error",
+                    score=0.0,
+                    comment=f"Error generating response: {str(e)}"
+                )
+            except Exception as e:
+                print(f"LangSmith logging error: {e}")
+
         return f"❌ Error generating response: {str(e)}"
 
+@traceable_function
 def clear_memory():
     """Clear all conversation memory"""
     try:
         memory_collection.delete(where={"type": {"$ne": ""}})
+
+        # Log memory clearance
+        if langsmith_client:
+            try:
+                langsmith_client.create_feedback(
+                    run_id=None,
+                    key="memory_cleared",
+                    score=1.0,
+                    comment="All conversation memory cleared"
+                )
+            except Exception as e:
+                print(f"LangSmith logging error: {e}")
+
         return "✅ Conversation memory cleared successfully!"
     except Exception as e:
         return f"❌ Error clearing memory: {str(e)}"
 
+@traceable_function
 def export_memory():
     """Export conversation memory as JSON"""
     try:
@@ -325,9 +673,52 @@ def export_memory():
         with open(filename, 'w') as f:
             json.dump(memories, f, indent=2)
 
+        # Log export
+        if langsmith_client:
+            try:
+                langsmith_client.create_feedback(
+                    run_id=None,
+                    key="memory_exported",
+                    score=1.0,
+                    comment=f"Exported {len(memories)} memories to {filename}"
+                )
+            except Exception as e:
+                print(f"LangSmith logging error: {e}")
+
         return f"✅ Memory exported to {filename}"
     except Exception as e:
         return f"❌ Error exporting memory: {str(e)}"
+
+def get_guardrails_status():
+    """Get status of safety guardrails"""
+    if NEMO_GUARDRAILS_AVAILABLE and nemo_rails is not None:
+        return "✅ NVIDIA NeMo Guardrails: ACTIVE"
+    else:
+        return "⚠️ NVIDIA NeMo Guardrails: NOT AVAILABLE"
+
+def get_token_usage():
+    """Get current token usage statistics"""
+    summary = token_tracker.get_summary()
+    return f"""
+📊 Token Usage Summary:
+• Total Tokens: {summary['total_tokens']:,}
+• Prompt Tokens: {summary['prompt_tokens']:,}
+• Completion Tokens: {summary['completion_tokens']:,}
+• Estimated Cost: ${summary['estimated_cost']}
+"""
+
+def reset_token_tracking():
+    """Reset token tracking counters"""
+    global token_tracker
+    token_tracker = TokenUsageTracker()
+    return "✅ Token tracking reset successfully!"
+
+def get_langsmith_status():
+    """Get LangSmith tracing status"""
+    if LANGCHAIN_AVAILABLE:
+        return "✅ LangSmith Tracing: ACTIVE"
+    else:
+        return "⚠️ LangSmith Tracing: NOT AVAILABLE"
 
 def load_pdf_and_chat(pdf_file, message, history):
     # First store the PDF
@@ -340,7 +731,7 @@ def load_pdf_and_chat(pdf_file, message, history):
 
 def launch_app():
     with gr.Blocks() as demo:
-        gr.Markdown("# ⚛️ Physics Teacher Chat with PDF RAG + Web Search + Memory")
+        gr.Markdown("# ⚛️ Physics Teacher Chat with PDF RAG + Web Search + Memory + Safety Guardrails + LangSmith Tracing")
 
         with gr.Row():
             with gr.Column():
@@ -348,25 +739,36 @@ def launch_app():
                 load_btn = gr.Button("Load PDF into Knowledge Base")
                 load_status = gr.Textbox(label="Load Status", interactive=False)
 
-                gr.Markdown("### Memory Management")
+                gr.Markdown("### Safety & Memory Management")
                 with gr.Row():
                     clear_mem_btn = gr.Button("🧹 Clear Memory")
                     export_mem_btn = gr.Button("💾 Export Memory")
+                    safety_status_btn = gr.Button("🛡️ Safety Status")
                 mem_status = gr.Textbox(label="Memory Status", interactive=False)
+
+                gr.Markdown("### Token Usage Tracking")
+                with gr.Row():
+                    token_stats_btn = gr.Button("📊 Token Usage")
+                    reset_tokens_btn = gr.Button("🔄 Reset Tracking")
+                    tracing_status_btn = gr.Button("🔍 Tracing Status")
+                token_status = gr.Textbox(label="Token Status", interactive=False)
 
                 gr.Markdown("""
                 ### How it works:
                 1. **Upload a PDF** - Answers prioritize PDF content when relevant
                 2. **Ask questions** - System uses PDF, web search, and past conversations
                 3. **Long-term memory** - Remembers past conversations for context
-                4. **Multiple sources** - Combines PDF 📚, Web 🔍, and Memory 💭
+                4. **Safety Guardrails** - NVIDIA NeMo Guardrails ensure safe, educational responses
+                5. **Multiple sources** - Combines PDF 📚, Web 🔍, and Memory 💭
+                6. **LangSmith Tracing** - Comprehensive tracing and token usage tracking
+                7. **Token Monitoring** - Real-time token usage and cost tracking
                 """)
 
             with gr.Column():
                 chat_interface = gr.ChatInterface(
                     fn=chat_with_physics_bot,
-                    title="Chat with Physics Bot (with Memory)",
-                    description="Ask questions about physics. I'll remember our past conversations and use multiple knowledge sources to help you!"
+                    title="Chat with Physics Bot (with Memory, Safety & Tracing)",
+                    description="Ask questions about physics. I'll remember our past conversations, use multiple knowledge sources, ensure safe responses, and track token usage!"
                 )
 
         # Load PDF when button clicked
@@ -387,6 +789,27 @@ def launch_app():
             outputs=[mem_status]
         )
 
+        safety_status_btn.click(
+            fn=get_guardrails_status,
+            outputs=[mem_status]
+        )
+
+        # Token tracking buttons
+        token_stats_btn.click(
+            fn=get_token_usage,
+            outputs=[token_status]
+        )
+
+        reset_tokens_btn.click(
+            fn=reset_token_tracking,
+            outputs=[token_status]
+        )
+
+        tracing_status_btn.click(
+            fn=get_langsmith_status,
+            outputs=[token_status]
+        )
+
     demo.launch()
 
 if __name__ == "__main__":
@@ -400,36 +823,24 @@ if __name__ == "__main__":
         print("Please get your free API key from: https://app.tavily.com/")
         print("Continuing without web search functionality...")
 
+    # Check for LangSmith API key
+    if not os.getenv("LANGCHAIN_API_KEY"):
+        print("⚠️  LANGCHAIN_API_KEY not found. LangSmith tracing will be disabled.")
+        print("💡 Get your free API key from: https://smith.langchain.com/")
+
     # Auto-load PDF if exists
     pdf_files = [f for f in os.listdir('.') if f.endswith('.pdf')]
     if pdf_files:
         print(f"Found PDF: {pdf_files[0]}")
         store_pdf_in_db(pdf_files[0])
 
-    print("🧠 Long-term memory enabled! The bot will remember past conversations.")
-    launch_app()
+    print("🧠 Long-term memory enabled!")
+    print("📊 Token usage tracking enabled!")
+    print(get_guardrails_status())
+    print(get_langsmith_status())
 
-import requests
-import os
+    if LANGCHAIN_AVAILABLE:
+        print("🔍 LangSmith tracing enabled! Visit https://smith.langchain.com/ to view traces.")
 
-def download_pdf_from_github(url, filename="PhysicsTeacher.pdf"):
-    response = requests.get(url)
-    response.raise_for_status()  # ensure no errors
-    with open(filename, "wb") as f:
-        f.write(response.content)
-    return filename
-
-if __name__ == "__main__":
-    # Correct GitHub raw URL
-    github_pdf_url = "https://github.com/sumit1311singh/PhysicsTeacher-CurrentElectricity-Bot/raw/main/Current_Electricity.pdf"
-
-    # Download PDF
-    pdf_file = download_pdf_from_github(github_pdf_url, "Physics-PDFs")
-    print(f"Downloaded PDF: {pdf_file}")
-
-    # Store in DB
-    store_pdf_in_db(pdf_file)
-
-    # Launch app
     launch_app()
 
