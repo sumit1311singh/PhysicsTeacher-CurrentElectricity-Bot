@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 import requests
 from urllib.parse import urlparse
 import re
+import json
+from datetime import datetime
+import uuid
 
 os.environ["OPENAI_API_KEY"] = "" #Add your OPENAI API Key
 load_dotenv()
@@ -27,9 +30,10 @@ from openai import OpenAI
 client = OpenAI(api_key="")
 
 # Initialize Tavily client with error handling
+os.environ["TAVILY_API_KEY"] = "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"
 try:
     from tavily import TavilyClient
-    tavily_client = TavilyClient(api_key="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")
+    tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     TAVILY_AVAILABLE = True
 except ImportError:
     TAVILY_AVAILABLE = False
@@ -38,7 +42,8 @@ except ImportError:
 
 # Initialize ChromaDB
 chroma_client = chromadb.Client()
-collection = chroma_client.create_collection(name="Physics-PDFs")
+pdf_collection = chroma_client.create_collection(name="PhysicsPDFs")
+memory_collection = chroma_client.create_collection(name="ConversationMemory")
 
 def extract_text_from_pdf(pdf_path):
     """Extract text from PDF file"""
@@ -65,11 +70,11 @@ def store_pdf_in_db(pdf_path):
         chunks = chunk_text(text)
 
         # Clear existing data
-        collection.delete(where={"source": {"$ne": ""}})  # Delete all documents
+        pdf_collection.delete(where={"source": {"$ne": ""}})  # Delete all documents
 
         # Add chunks to ChromaDB
         for i, chunk in enumerate(chunks):
-            collection.add(
+            pdf_collection.add(
                 documents=[chunk],
                 metadatas=[{"source": pdf_path, "chunk_id": i}],
                 ids=[f"chunk_{i}_{os.path.basename(pdf_path)}"]
@@ -81,7 +86,7 @@ def store_pdf_in_db(pdf_path):
 def get_relevant_context(query, n_results=3):
     """Retrieve relevant context from ChromaDB"""
     try:
-        results = collection.query(
+        results = pdf_collection.query(
             query_texts=[query],
             n_results=n_results
         )
@@ -89,6 +94,78 @@ def get_relevant_context(query, n_results=3):
     except Exception as e:
         print(f"ChromaDB query error: {e}")
         return ""
+
+def store_conversation_memory(user_message, bot_response, conversation_context=""):
+    """Store conversation in long-term memory"""
+    try:
+        # Create a memory entry
+        memory_id = str(uuid.uuid4())
+        timestamp = datetime.now().isoformat()
+
+        # Combine user message and bot response for semantic search
+        memory_text = f"User: {user_message}\nBot: {bot_response}"
+
+        if conversation_context:
+            memory_text = f"Context: {conversation_context}\n{memory_text}"
+
+        # Store in memory collection
+        memory_collection.add(
+            documents=[memory_text],
+            metadatas=[{
+                "type": "conversation",
+                "timestamp": timestamp,
+                "user_message": user_message,
+                "bot_response": bot_response,
+                "conversation_context": conversation_context
+            }],
+            ids=[memory_id]
+        )
+
+        return True
+    except Exception as e:
+        print(f"Memory storage error: {e}")
+        return False
+
+def get_relevant_memories(query, n_results=2):
+    """Retrieve relevant past conversations from memory"""
+    try:
+        results = memory_collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
+
+        memories = []
+        if results['documents']:
+            for i, doc in enumerate(results['documents'][0]):
+                metadata = results['metadatas'][0][i]
+                memory_text = f"Previous conversation ({metadata['timestamp'][:10]}): {doc}"
+                memories.append(memory_text)
+
+        return "\n\n".join(memories) if memories else ""
+    except Exception as e:
+        print(f"Memory retrieval error: {e}")
+        return ""
+
+def get_conversation_summary(history):
+    """Generate a summary of the current conversation context"""
+    if not history:
+        return ""
+
+    # Take last few exchanges for context
+    recent_history = history[-3:] if len(history) > 3 else history
+    context_parts = []
+
+    for exchange in recent_history:
+        if isinstance(exchange, tuple) and len(exchange) == 2:
+            user_msg, bot_msg = exchange
+            context_parts.append(f"User: {user_msg}")
+            context_parts.append(f"Bot: {bot_msg}")
+        elif isinstance(exchange, list) and len(exchange) == 2:
+            user_msg, bot_msg = exchange
+            context_parts.append(f"User: {user_msg}")
+            context_parts.append(f"Bot: {bot_msg}")
+
+    return "\n".join(context_parts)
 
 def is_pdf_context_relevant(pdf_context, query):
     """Check if PDF context is actually relevant to the query"""
@@ -156,26 +233,52 @@ def search_with_tavily(query):
         return f"❌ Search error: {str(e)}"
 
 def chat_with_physics_bot(message, history):
-    # First try to get relevant context from PDF
+    # Get relevant context from different sources
     pdf_context = get_relevant_context(message)
+    memory_context = get_relevant_memories(message)
+    conversation_context = get_conversation_summary(history)
 
     # Check if PDF context is actually relevant
     use_pdf = is_pdf_context_relevant(pdf_context, message)
 
-    system_prompt = """You are a friendly Physics Teacher Bot. Follow these rules:
-    1. Use the provided context to answer questions accurately
+    system_prompt = """You are a friendly Physics Teacher Bot with memory. Follow these rules:
+    1. Use the provided context from PDFs, past conversations, and search results to answer questions accurately
     2. If the context doesn't fully answer the question, use your knowledge to provide a complete answer
-    3. Be educational and clear in your explanations"""
+    3. Reference past conversations when relevant to provide continuity
+    4. Be educational and clear in your explanations
+    5. Maintain context from the current conversation flow"""
+
+    # Build context sections
+    context_sections = []
+    source_notes = []
 
     if use_pdf:
-        # Use PDF context
-        user_content = f"Context from PDF:\n{pdf_context}\n\nQuestion: {message}"
-        source_note = "📚 Answer based on uploaded PDF"
-    else:
-        # Use web search
+        context_sections.append(f"PDF Knowledge:\n{pdf_context}")
+        source_notes.append("📚 PDF")
+
+    if memory_context:
+        context_sections.append(f"Past Conversations:\n{memory_context}")
+        source_notes.append("💭 Memory")
+
+    if conversation_context:
+        context_sections.append(f"Current Conversation:\n{conversation_context}")
+
+    # If no PDF context is relevant, use web search
+    if not use_pdf:
         search_results = search_with_tavily(message)
-        user_content = f"Search Results:\n{search_results}\n\nQuestion: {message}"
-        source_note = "🔍 Answer based on web search"
+        context_sections.append(f"Web Search:\n{search_results}")
+        source_notes.append("🔍 Web")
+
+    # Combine all contexts
+    combined_context = "\n\n".join(context_sections) if context_sections else "No specific context available."
+    source_note = " + ".join(source_notes) if source_notes else "General knowledge"
+
+    user_content = f"""Available Context:
+{combined_context}
+
+Question: {message}
+
+Please provide a helpful answer based on the available context above."""
 
     try:
         response = client.chat.completions.create(
@@ -188,10 +291,43 @@ def chat_with_physics_bot(message, history):
         )
 
         bot_response = response.choices[0].message.content
-        return f"{source_note}\n\n{bot_response}"
+
+        # Store this conversation in long-term memory
+        store_conversation_memory(message, bot_response, conversation_context)
+
+        return f"🔮 Sources: {source_note}\n\n{bot_response}"
 
     except Exception as e:
         return f"❌ Error generating response: {str(e)}"
+
+def clear_memory():
+    """Clear all conversation memory"""
+    try:
+        memory_collection.delete(where={"type": {"$ne": ""}})
+        return "✅ Conversation memory cleared successfully!"
+    except Exception as e:
+        return f"❌ Error clearing memory: {str(e)}"
+
+def export_memory():
+    """Export conversation memory as JSON"""
+    try:
+        results = memory_collection.get()
+        memories = []
+
+        for i, doc in enumerate(results['documents']):
+            memories.append({
+                "content": doc,
+                "metadata": results['metadatas'][i],
+                "id": results['ids'][i]
+            })
+
+        filename = f"conversation_memory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filename, 'w') as f:
+            json.dump(memories, f, indent=2)
+
+        return f"✅ Memory exported to {filename}"
+    except Exception as e:
+        return f"❌ Error exporting memory: {str(e)}"
 
 def load_pdf_and_chat(pdf_file, message, history):
     # First store the PDF
@@ -204,7 +340,7 @@ def load_pdf_and_chat(pdf_file, message, history):
 
 def launch_app():
     with gr.Blocks() as demo:
-        gr.Markdown("# ⚛️ Physics Teacher chatbot with PDF RAG")
+        gr.Markdown("# ⚛️ Physics Teacher Chat with PDF RAG + Web Search + Memory")
 
         with gr.Row():
             with gr.Column():
@@ -212,18 +348,25 @@ def launch_app():
                 load_btn = gr.Button("Load PDF into Knowledge Base")
                 load_status = gr.Textbox(label="Load Status", interactive=False)
 
+                gr.Markdown("### Memory Management")
+                with gr.Row():
+                    clear_mem_btn = gr.Button("🧹 Clear Memory")
+                    export_mem_btn = gr.Button("💾 Export Memory")
+                mem_status = gr.Textbox(label="Memory Status", interactive=False)
+
                 gr.Markdown("""
                 ### How it works:
-                1. **Upload a PDF** - Answers will prioritize PDF content ONLY when relevant
-                2. **Ask questions** - If PDF doesn't have relevant answers, web search will be used
-                3. **Clear indicators** - Sources are clearly marked (📚 PDF or 🔍 Web)
+                1. **Upload a PDF** - Answers prioritize PDF content when relevant
+                2. **Ask questions** - System uses PDF, web search, and past conversations
+                3. **Long-term memory** - Remembers past conversations for context
+                4. **Multiple sources** - Combines PDF 📚, Web 🔍, and Memory 💭
                 """)
 
             with gr.Column():
                 chat_interface = gr.ChatInterface(
                     fn=chat_with_physics_bot,
-                    title="Chat with Physics Teacher Bot",
-                    description="Ask questions about the loaded PDF or related to Physics concepts. The bot will use PDF content only when relevant, otherwise use web search."
+                    title="Chat with Physics Bot (with Memory)",
+                    description="Ask questions about physics. I'll remember our past conversations and use multiple knowledge sources to help you!"
                 )
 
         # Load PDF when button clicked
@@ -233,7 +376,38 @@ def launch_app():
             outputs=[load_status]
         )
 
+        # Memory management buttons
+        clear_mem_btn.click(
+            fn=clear_memory,
+            outputs=[mem_status]
+        )
+
+        export_mem_btn.click(
+            fn=export_memory,
+            outputs=[mem_status]
+        )
+
     demo.launch()
+
+if __name__ == "__main__":
+    # Check for required API keys
+    if not os.getenv("OPENAI_API_KEY"):
+        print("❌ OPENAI_API_KEY not found in environment variables")
+        exit(1)
+
+    if not os.getenv("TAVILY_API_KEY") and TAVILY_AVAILABLE:
+        print("❌ TAVILY_API_KEY not found in environment variables")
+        print("Please get your free API key from: https://app.tavily.com/")
+        print("Continuing without web search functionality...")
+
+    # Auto-load PDF if exists
+    pdf_files = [f for f in os.listdir('.') if f.endswith('.pdf')]
+    if pdf_files:
+        print(f"Found PDF: {pdf_files[0]}")
+        store_pdf_in_db(pdf_files[0])
+
+    print("🧠 Long-term memory enabled! The bot will remember past conversations.")
+    launch_app()
 
 import requests
 import os
