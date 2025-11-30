@@ -1,0 +1,4 @@
+# rails/domain.co
+define bot behavior
+  when user asks non-educational topics not related to physics or science
+    bot says "[BLOCK:DOMAIN] I’m a physics tutor. Please ask science or education topics."

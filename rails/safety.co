@@ -1,0 +1,4 @@
+# rails/safety.co
+define bot behavior
+  when user asks for harmful or illegal content
+    bot says "[BLOCK:SAFETY] I can’t help with harmful, dangerous, or illegal topics."
