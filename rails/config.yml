@@ -1,0 +1,18 @@
+models:
+  - type: main
+    engine: openai
+    model: gpt-3.5-turbo
+    parameters:
+      temperature: 0
+
+rails:
+  input:
+    flows: []
+  output:
+    flows: []
+
+instructions:
+  - type: general
+    content: |
+      You are a physics teaching assistant. Provide accurate, educational, and safe responses.
+      Politely decline unsafe or off-topic requests and redirect to physics/science learning.
