@@ -11,7 +11,9 @@ Original file is located at
 ! pip install chromadb
 ! pip install tavily
 ! pip install nemoguardrails
-! pip install langchain openai
+! pip install -U langchain-openai
+
+#pip install langchain==0.0.353
 
 from openai import OpenAI
 import gradio as gr
@@ -27,9 +29,8 @@ import json
 from datetime import datetime
 import uuid
 from sentence_transformers import SentenceTransformer, util
-from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import LLMChain
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain_openai import ChatOpenAI
 
 os.environ["OPENAI_API_KEY"] = "" #Add your OPENAI API Key
 load_dotenv()
@@ -88,7 +89,6 @@ chroma_client = chromadb.Client()
 pdf_collection = chroma_client.create_collection(name="PhysicsPDFs")
 memory_collection = chroma_client.create_collection(name="ConversationMemory")
 
-# Cell: allow sync generate inside notebook event loop
 import nest_asyncio
 nest_asyncio.apply()
 print("✅ Enabled nested asyncio; sync guardrails.generate() is now allowed.")
@@ -100,7 +100,7 @@ assert "OPENAI_API_KEY" in os.environ, "Set OPENAI_API_KEY in environment."
 
 # Load config from file
 config = RailsConfig.from_path("rails")
-#print("Models in config:", config.as_dict().get("models"))  # sanity check
+#print("Models in config:", config.as_dict().get("models"))
 nemo_rails = LLMRails(config)
 print("✅ NeMo Guardrails initialized from rails/")
 
@@ -112,7 +112,6 @@ def apply_guardrails(user_message: str, bot_response: str = ""):
     - If allowed, message is either the original bot_response or 'OK'.
     """
     if not NEMO_GUARDRAILS_AVAILABLE:
-        # fallback: keyword safety check
         return apply_keyword_safety_check(user_message, bot_response)
 
     try:
@@ -224,7 +223,7 @@ def store_pdf_in_db(pdf_path):
         if langsmith_client:
             try:
                 langsmith_client.create_feedback(
-                    run_id=None,  # Will be associated with current trace
+                    run_id=None,
                     key="pdf_processing",
                     score=1.0,
                     comment=f"Processed {len(chunks)} chunks from {pdf_path}"
@@ -356,42 +355,6 @@ def is_pdf_context_relevant(pdf_context, query):
     return True
 
 @traceable_function
-def search_with_tavily(query):
-    """Search using Tavily and get content from first result"""
-    if not TAVILY_AVAILABLE:
-        return "Web search unavailable. Please install tavily-python: pip install tavily-python"
-
-    try:
-        # Search for the query
-        search_response = tavily_client.search(
-            query=query,
-            search_depth="basic",
-            max_results=3
-        )
-
-        if not search_response.get('results'):
-            return "No search results found."
-
-        # Get the first result
-        first_result = search_response['results'][0]
-        first_url = first_result.get('url', '')
-
-        # Use Tavily's content if available
-        content = first_result.get('content', '')
-
-        if not content:
-            content = f"Title: {first_result.get('title', 'N/A')}\nURL: {first_url}"
-
-        # Check if it's a PDF
-        if first_url.lower().endswith('.pdf'):
-            return f"📄 PDF Source: {first_url}\n\nThis appears to be a PDF document. Please visit the link to view the PDF: {first_url}"
-
-        return f"🔍 Search Result from: {first_url}\n\n{content}"
-
-    except Exception as e:
-        return f"❌ Search error: {str(e)}"
-
-@traceable_function
 def apply_keyword_safety_check(user_message, bot_response):
     """Fallback keyword-based safety check"""
     harmful_keywords = [
@@ -414,94 +377,24 @@ def apply_keyword_safety_check(user_message, bot_response):
 
     return bot_response, "🛡️ Safety check passed"
 
-# Cell: generator helper using nemo_rails + prompt_mgr
-
 def _extract_text_from_reply(reply):
     if reply is None:
         return ""
     if isinstance(reply, str):
         return reply
     if isinstance(reply, dict):
-        if "content" in reply and isinstance(reply["content"], str):
-            return reply["content"]
-        if "message" in reply and isinstance(reply["message"], str):
-            return reply["message"]
-        choices = reply.get("choices") or reply.get("outputs") or None
-        if choices and isinstance(choices, (list, tuple)) and len(choices) > 0:
+        for k in ("content", "message", "text"):
+            if isinstance(reply.get(k), str):
+                return reply[k]
+        choices = reply.get("choices") or reply.get("outputs")
+        if isinstance(choices, list) and choices:
             first = choices[0]
             if isinstance(first, dict):
-                msg = first.get("message") or first.get("content") or first.get("text")
-                if isinstance(msg, dict):
-                    return msg.get("content") or msg.get("text") or ""
-                if isinstance(msg, str):
-                    return msg
-            elif isinstance(first, str):
-                return first
-        return str(reply.get("content") or reply.get("message") or "")
-    if isinstance(reply, (list, tuple)) and len(reply) > 0:
+                return first.get("message", {}).get("content") or first.get("content", "")
+    if isinstance(reply, (list, tuple)) and reply:
         return _extract_text_from_reply(reply[0])
     return str(reply)
 
-def _extract_text_from_reply1(reply):
-    if reply is None:
-        return ""
-    if isinstance(reply, str):
-        return reply
-    if isinstance(reply, dict):
-        # common keys: 'content', 'message', 'text', 'choices'
-        if "content" in reply and isinstance(reply["content"], str):
-            return reply["content"]
-        if "message" in reply and isinstance(reply["message"], str):
-            return reply["message"]
-        # NeMo-like: maybe reply is {'choices': [{'message': {'content': '...'}}]}
-        choices = reply.get("choices") or reply.get("outputs") or None
-        if choices and isinstance(choices, (list, tuple)) and len(choices) > 0:
-            first = choices[0]
-            if isinstance(first, dict):
-                # try nested message.content
-                msg = first.get("message") or first.get("content") or first.get("text")
-                if isinstance(msg, dict):
-                    return msg.get("content") or msg.get("text") or ""
-                if isinstance(msg, str):
-                    return msg
-            elif isinstance(first, str):
-                return first
-        # fallback: stringify small parts
-        return str(reply.get("content") or reply.get("message") or "")
-    # lists/tuples
-    if isinstance(reply, (list, tuple)) and len(reply) > 0:
-        return _extract_text_from_reply(reply[0])
-    return str(reply)
-
-
-def answer_query_with_nemo(user_message: str, memory_summary: str = "", diagnostics: dict = None, clarify: bool = False):
-    """
-    Calls nemo_rails.generate with system + user messages rendered from prompt_mgr.
-    Returns (assistant_text: str, raw_reply: Any)
-    """
-    system_text = prompt_mgr.render_system()
-    user_text = prompt_mgr.render_user(user_message, clarify=clarify, memory_summary=memory_summary, diagnostics=diagnostics)
-
-    messages = [
-        {"role": "system", "content": system_text},
-        {"role": "user", "content": user_text},
-    ]
-
-    try:
-        reply = nemo_rails.generate(messages=messages)
-    except Exception as e:
-        # fallback: return error-like message and the exception for logging
-        return f"Error generating response: {e}", {"error": str(e)}
-
-    assistant_text = _extract_text_from_reply(reply)
-    return assistant_text, reply
-
-ans, raw, src = generate_answer("what is resistance in current electricity?", memory_summary="", diagnostics={}, clarify=False)
-print("Answer:", ans)
-print("Source:", src)
-print("Raw type:", type(raw))
-
-# Diagnostics CSV logger
 import csv
 from pathlib import Path
 from datetime import datetime
@@ -510,7 +403,6 @@ LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 DIAG_CSV = LOGS_DIR / "diagnostics.csv"
 
-# ensure header exists
 if not DIAG_CSV.exists():
     with DIAG_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -540,13 +432,11 @@ def log_diagnostics_csv(user_message: str, allowed: bool, clarify: bool, generat
         harm_max = _safe_get(diagnostics, "harm_max", "")
         length = _safe_get(diagnostics, "len_tokens", "")
         snippet = (answer_text or "")[:400].replace("\n", " ").strip()
-        # raw_reply_summary: try to capture role/content keys if present
         raw_summary = ""
         try:
             if isinstance(raw_reply, dict):
                 raw_summary = raw_reply.get("content") or str({k: raw_reply.get(k) for k in ("role","type") if k in raw_reply})
             elif isinstance(raw_reply, (list, tuple)):
-                # summarize first element
                 first = raw_reply[0]
                 if isinstance(first, dict):
                     raw_summary = first.get("content", "")[:200]
@@ -564,7 +454,6 @@ def log_diagnostics_csv(user_message: str, allowed: bool, clarify: bool, generat
             writer = csv.writer(f)
             writer.writerow(row)
     except Exception:
-        # never raise from logger
         pass
 
 print("✅ diagnostics CSV logger ready:", DIAG_CSV)
@@ -574,7 +463,6 @@ def rewrite_ambiguous_query_with_llm(user_message: str, history: list, max_histo
     Ask the LLM to rewrite a short/ambiguous user_message into an explicit query
     using the last few turns. Returns the rewritten string or the original message.
     """
-    # Build a short prompt that is safe and deterministic
     recent = []
     for turn in history[-max_history_turns:]:
         if isinstance(turn, (list, tuple)) and len(turn) >= 2:
@@ -591,223 +479,77 @@ def rewrite_ambiguous_query_with_llm(user_message: str, history: list, max_histo
         "'dimensions of resistance and resistivity')."
     )
 
-    # Call your generator in a lightweight mode; prefer the same generator you use for answers
     rewritten, raw, src = generate_answer(rewrite_prompt, history=[], clarify=False, prefer_generator="nemo")
-    # Basic safety: if rewrite looks like a template or is empty, keep original
     if not rewritten or len(rewritten.strip()) < 3 or "{user_message}" in rewritten:
         return user_message
     return rewritten.strip()
 
-# Top-level handler that vets and generates
+def build_clarification_payload(user_message, memory_summary="", diagnostics=None):
+    body = prompt_mgr.render_clarify_user(
+        original_query=user_message,
+        memory_summary=memory_summary,
+        diagnostics=diagnostics
+    )
+    return {
+        "title": "Quick clarification",
+        "preview": body.split("\n")[0],
+        "body": body,
+        "quick_replies": [
+            "Electrical resistance in circuits.",
+            "Air resistance in motion.",
+            "Give a short definition with one circuit example."
+        ],
+        "diagnostics": diagnostics or {},
+        "memory_summary": memory_summary or ""
+    }
 
-def handle_user_message(user_message: str, history=None, prefer_generator: str = None):
-    """
-    Top-level handler:
-    - RAG-first: try PDF -> memory -> web
-    - If RAG yields a confident context, generate immediately using that context + history
-    - Otherwise run vet_query; if clarify==False, generate using history and diagnostics
-    - If clarify==True, return a user-facing clarification payload
-    """
-    # Ensure history is a list
+def handle_user_message(user_message, history=None, prefer_generator=None):
     history = history or []
-    print("handle_user_message history len:", len(history or []), "history:", history[-6:])
 
     user_message = rewrite_ambiguous_query_with_llm(user_message, history)
 
-    # 1) Try RAG: PDF context and memory context
-    pdf_context = get_relevant_context(user_message, n_results=3) or ""
-    memory_context = get_relevant_memories(user_message, n_results=2) or ""
+    pdf_context = get_relevant_context(user_message, 3)
+    memory_context = get_relevant_memories(user_message, 2)
 
-    use_pdf = is_pdf_context_relevant(pdf_context, user_message)
-
-    # 2) If PDF is useful, generate immediately using augmented context + history
-    if use_pdf:
-        augmented_message = f"Context:\n{pdf_context}\n\nUser question: {user_message}"
-        answer_text, raw_reply, source = generate_answer(
-            augmented_message,
-            memory_summary=memory_context,
-            diagnostics={},
-            clarify=False,
-            history=history,
-            pdf_context=pdf_context,
-            prefer_generator=prefer_generator
-        )
+    if is_pdf_context_relevant(pdf_context, user_message):
         return {
             "allowed": True,
             "clarify": False,
-            "answer": answer_text,
-            "raw_reply": raw_reply,
-            "diagnostics": {},
-            "memory_summary": memory_context,
-            "generator": source,
+            "answer": generate_answer(
+                f"Context:\n{pdf_context}\n\nUser question: {user_message}",
+                memory_summary=memory_context,
+                history=history,
+                pdf_context=pdf_context,
+                prefer_generator=prefer_generator
+            )[0]
         }
 
-    # 3) No confident RAG hit: vet the query (guardrails + educational filter)
     ok, payload = vet_query(user_message)
     if not ok:
-        return {"allowed": False, "answer": None, "reason": payload.get("reason")}
+        return {"allowed": False, "reason": payload.get("reason")}
 
-    memory_summary = payload.get("memory_summary", "")
-    diagnostics = payload.get("diagnostics", {})
-    clarify = payload.get("clarify", False)
-
-    # 4) If clarify requested, return user-facing clarification payload
-    if clarify:
-        clarif_text = prompt_mgr.render_clarify_user(
-            original_query=user_message,
-            memory_summary=memory_summary,
-            diagnostics=diagnostics
-        )
-        clarif_payload = {
-            "title": "Quick clarification",
-            "preview": clarif_text.split("\n")[0],
-            "body": clarif_text,
-            "quick_replies": [
-                "Electrical resistance in circuits.",
-                "Air resistance in motion.",
-                "Give a short definition with one circuit example."
-            ],
-            "diagnostics": diagnostics or {},
-            "memory_summary": memory_summary or ""
-        }
-        # log diagnostics if you want
-        try:
-            log_diagnostics_csv(
-                user_message=user_message, allowed=True, clarify=True,
-                generator="clarify", diagnostics=diagnostics,
-                answer_text=clarif_payload.get("preview", ""),
-                raw_reply={"clarification_payload": clarif_payload}
-            )
-        except Exception:
-            pass
-
+    if payload.get("clarify"):
         return {
             "allowed": True,
             "clarify": True,
-            "clarification_payload": clarif_payload,
-            "diagnostics": diagnostics,
-            "memory_summary": memory_summary,
-            "generator": "clarify",
+            "clarification_payload": build_clarification_payload(
+                user_message,
+                payload.get("memory_summary", ""),
+                payload.get("diagnostics", {})
+            )
         }
 
-    # 5) Otherwise generate an answer using history + memory + diagnostics
-    answer_text, raw_reply, source = generate_answer(
+    answer, raw, src = generate_answer(
         user_message,
-        memory_summary=memory_summary,
-        diagnostics=diagnostics,
-        clarify=False,
+        memory_summary=payload.get("memory_summary", ""),
+        diagnostics=payload.get("diagnostics", {}),
         history=history,
-        pdf_context=pdf_context,
         prefer_generator=prefer_generator
     )
 
-    # store memory and log diagnostics as appropriate
-    try:
-        store_conversation_memory(user_message, answer_text, conversation_context=memory_summary)
-    except Exception:
-        pass
+    store_conversation_memory(user_message, answer, payload.get("memory_summary", ""))
+    return {"allowed": True, "clarify": False, "answer": answer}
 
-    try:
-        log_diagnostics_csv(
-            user_message=user_message, allowed=True, clarify=False,
-            generator=source, diagnostics=diagnostics,
-            answer_text=(answer_text or "")[:400], raw_reply=raw_reply
-        )
-    except Exception:
-        pass
-
-    return {
-        "allowed": True,
-        "clarify": False,
-        "answer": answer_text,
-        "raw_reply": raw_reply,
-        "diagnostics": diagnostics,
-        "memory_summary": memory_summary,
-        "generator": source,
-    }
-
-def handle_user_message1(user_message: str, prefer_generator: str = None):
-    pdf_context = get_relevant_context(user_message, n_results=3)  # existing function
-    memory_context = get_relevant_memories(user_message, n_results=2)  # existing function
-
-    # 2) Decide if PDF context is actually useful
-    use_pdf = is_pdf_context_relevant(pdf_context, user_message)
-
-    # If PDF is useful, prefer it and generate answer immediately using that context
-    if use_pdf:
-        # Prepend the PDF context to the user message so the prompt_mgr includes it
-        augmented_message = f"Context:\n{pdf_context}\n\nUser question: {user_message}"
-        answer_text, raw_reply, source = generate_answer(
-            user_message=augmented_message,
-            memory_summary=memory_summary,
-            diagnostics={},  # or pass diagnostics if available
-            clarify=False
-        )
-        # store memory, log diagnostics as you already do
-        return {
-            "allowed": True,
-            "clarify": False,
-            "answer": answer_text,
-            "raw_reply": raw_reply,
-            "diagnostics": {},
-            "memory_summary": memory_summary,
-            "generator": source,
-        }
-    ok, payload = vet_query(user_message)
-    if not ok:
-        return {"allowed": False, "answer": None, "reason": payload.get("reason")}
-
-    memory_summary = payload.get("memory_summary", "")
-    diagnostics = payload.get("diagnostics", {})
-    clarify = payload.get("clarify", False)
-
-    # If clarify is True, return the clarification prompt instead of generating a full answer
-    if clarify:
-        clarif_text = prompt_mgr.render_clarify_user(
-            original_query=user_message,
-            memory_summary=memory_summary,
-            diagnostics=diagnostics
-        )
-        clarif_payload = {
-            "title": "Quick clarification",
-            "preview": clarif_text.split("\n")[0],
-            "body": clarif_text,
-            "quick_replies": [
-                "Electrical resistance in circuits.",
-                "Air resistance in motion.",
-                "Give a short definition with one circuit example."
-            ],
-            "diagnostics": diagnostics or {},
-            "memory_summary": memory_summary or ""
-        }
-
-        try:
-            log_diagnostics_csv(
-                user_message=user_message, allowed=True, clarify=True,
-                generator="clarify", diagnostics=diagnostics,
-                answer_text=clarif_payload.get("preview", ""),
-                raw_reply={"clarification_payload": clarif_payload}
-            )
-        except Exception:
-            pass
-
-        return {
-            "allowed": True,
-            "clarify": True,
-            "clarification_payload": clarif_payload,
-            "diagnostics": diagnostics,
-            "memory_summary": memory_summary,
-            "generator": "clarify",
-        }
-
-    # Otherwise generate a full answer as before
-    answer_text, raw_reply, source = generate_answer(user_message, memory_summary=memory_summary, diagnostics=diagnostics, clarify=False)
-    return {"allowed": True, "clarify": False, "answer": answer_text, "raw_reply": raw_reply, "generator": source}
-
-# quick smoke test (run after adding cell)
-#print(handle_user_message("What is resistance in a circuit?"))
-
-# Cell: accept clarification and generate final answer (new cell)
 def accept_clarification_and_generate(clarification_text: str, original_user_message: str = None,
                                       diagnostics: dict = None, memory_summary: str = "", prefer_generator: str = None):
     """
@@ -817,7 +559,6 @@ def accept_clarification_and_generate(clarification_text: str, original_user_mes
     - diagnostics, memory_summary: optional, passed through from vet_query
     Returns the same structure as handle_user_message but with clarify=False and final answer.
     """
-    # Optionally log that the user confirmed a clarification (best-effort)
     try:
         log_diagnostics_csv(user_message=original_user_message or clarification_text,
                             allowed=True, clarify=False, generator="clarify_confirm",
@@ -825,7 +566,6 @@ def accept_clarification_and_generate(clarification_text: str, original_user_mes
     except Exception:
         pass
 
-    # Now generate the final answer using the chosen generator
     answer_text, raw_reply, source = generate_answer(
         user_message=clarification_text,
         memory_summary=memory_summary,
@@ -834,13 +574,11 @@ def accept_clarification_and_generate(clarification_text: str, original_user_mes
         prefer=prefer_generator
     )
 
-    # store interaction in memory (best-effort)
     try:
         memory.store_interaction(user_message=clarification_text, assistant_reply=answer_text, diagnostics=diagnostics or {})
     except Exception:
         pass
 
-    # log the final generation
     try:
         log_diagnostics_csv(user_message=clarification_text, allowed=True, clarify=False,
                             generator=source, diagnostics=diagnostics or {},
@@ -858,13 +596,11 @@ def accept_clarification_and_generate(clarification_text: str, original_user_mes
         "generator": source,
     }
 
-# Tweak these values to change when clarification is requested
-
 CLARIFY_CONFIG = {
-    "max_short_tokens": 6,        # queries with <= this token count are considered "short"
-    "edu_lower": 0.30,            # lower bound of edu_topk_mean to consider borderline
-    "edu_upper": 0.38,            # upper bound of edu_topk_mean for borderline
-    "force_clarify_on_empty": True,  # clarify if diagnostics missing or empty for short queries
+    "max_short_tokens": 6,
+    "edu_lower": 0.30,
+    "edu_upper": 0.38,
+    "force_clarify_on_empty": True,
 }
 
 def decide_clarify(diagnostics: dict, len_tokens: int) -> bool:
@@ -873,41 +609,13 @@ def decide_clarify(diagnostics: dict, len_tokens: int) -> bool:
     or explicit ambiguity. Do not force clarify on empty diagnostics.
     """
     if not isinstance(diagnostics, dict) or not diagnostics:
-        # Do not force clarification just because diagnostics is empty
         return False
 
     edu_score = float(diagnostics.get("edu_topk_mean", 0.0))
-    # short query borderline range -> clarify
     if len_tokens <= CLARIFY_CONFIG["max_short_tokens"] and CLARIFY_CONFIG["edu_lower"] <= edu_score < CLARIFY_CONFIG["edu_upper"]:
         return True
 
-    # Add other rules if needed (e.g., multiple high-scoring conflicting contexts)
     return False
-
-@traceable_function
-def apply_safety_guardrails(user_message, bot_response):
-    """Apply NeMo Guardrails for safety and content filtering"""
-    if not NEMO_GUARDRAILS_AVAILABLE:
-        return bot_response, "⚠️ Guardrails disabled"
-
-    try:
-        # Use NeMo Guardrails for safety checking
-        guarded_response = nemo_rails.generate(
-            messages=[{"role": "user", "content": user_message}]
-        )
-
-        guarded_response = _extract_text_from_reply(guarded_response)
-
-        # If guardrails modified the response, use the guarded version
-        if guarded_response and guarded_response != bot_response:
-            return guarded_response, "🛡️ Response moderated by guardrails"
-
-        return bot_response, "🛡️ Safety check passed"
-
-    except Exception as e:
-        print(f"Guardrails error: {e}")
-        # Fallback to keyword-based safety check
-        return apply_keyword_safety_check(user_message, bot_response)
 
 from sentence_transformers import SentenceTransformer, util
 import torch
@@ -958,11 +666,9 @@ _negation_re = re.compile(
 @lru_cache(maxsize=4096)
 def _embed_text_cached(text: str) -> torch.Tensor:
     emb = model.encode(text, convert_to_tensor=True)  # (D,)
-    # keep user embedding as 1-D for cos_sim compatibility
     if emb.dim() == 2 and emb.shape[0] == 1:
         emb = emb.squeeze(0)
-    # normalize 1-D vector safely
-    emb = normalize_rows(emb)  # returns 1-D
+    emb = normalize_rows(emb)
     return emb
 
 @traceable_function
@@ -992,20 +698,15 @@ def check_educational_context(
             return False, "This short query contains harmful keywords"
         if edu_hits >= keyword_fallback_threshold:
             return True, "OK"
-        # fall through to embedding check for ambiguous short queries
 
     # Embedding-based checks
     user_emb = _embed_text_cached(text)  # normalized
-
-    # compute cosine similarities to each set
     harm_sims = util.cos_sim(user_emb, harmful_embeds).cpu().numpy().flatten()
     edu_sims = util.cos_sim(user_emb, educational_embeds).cpu().numpy().flatten()
 
-    # ensure harm_sims and edu_sims are numpy arrays
     harm_sims = np.asarray(harm_sims)
     edu_sims = np.asarray(edu_sims)
 
-    # top-k mean using numpy
     harm_topk_mean = float(np.sort(harm_sims)[-top_k:].mean())
     harm_max = float(harm_sims.max())
     edu_topk_mean = float(np.sort(edu_sims)[-top_k:].mean())
@@ -1030,14 +731,8 @@ def check_educational_context(
     # Default: block with helpful message
     return False, "Please ask questions related to physics or education."
 
-# Prompt loader and LangChain templates
 import yaml
 from pathlib import Path
-from langchain.prompts.chat import (
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-    ChatPromptTemplate,
-)
 
 TEMPLATES_PATH = Path("prompts/templates.yml")
 
@@ -1060,13 +755,11 @@ chat_prompt_default = ChatPromptTemplate.from_messages([system_msg_template, hum
 
 class _MemoryStub:
     def get_summary_for_user(self, *args, **kwargs):
-        # return empty string or a short default summary
         return ""
 
     def store_interaction(self, *args, **kwargs):
         return True
 
-# expose as `memory` so existing code works unchanged
 memory = _MemoryStub()
 
 import logging
@@ -1078,7 +771,6 @@ def vet_query(user_message: str):
         return False, {"reason": msg}
 
     result = check_educational_context(user_message)
-    # support both 2-tuple and 3-tuple returns
     if isinstance(result, tuple) and len(result) == 3:
         allow, reason, diagnostics = result
     elif isinstance(result, tuple) and len(result) == 2:
@@ -1092,27 +784,20 @@ def vet_query(user_message: str):
     if not allow:
         return False, {"reason": reason, "diagnostics": diagnostics}
 
-    # Lightweight RAG check (safe to call here)
     pdf_context = ""
     try:
         pdf_context = get_relevant_context(user_message, n_results=3)
     except Exception:
         pdf_context = ""
 
-    # If PDF context exists and is relevant, do not force clarification here
     if pdf_context and is_pdf_context_relevant(pdf_context, user_message):
-        # Let the caller handle generating with PDF context (RAG-first)
         return True, {"memory_summary": memory.get_summary_for_user() if hasattr(memory, "get_summary_for_user") else "", "diagnostics": diagnostics, "clarify": False}
 
-    # Now decide clarify using the diagnostics but do NOT force clarify just because diagnostics is empty
-    # (only clarify when diagnostics indicate borderline educational intent or explicit ambiguity)
     clarify = decide_clarify(diagnostics, diagnostics.get("len_tokens", 0))
 
-    # If diagnostics is empty and RAG returned nothing, prefer to generate a short answer rather than clarify
     if (not diagnostics) and (not pdf_context):
         clarify = False
 
-    # Return as before
     return True, {"memory_summary": memory.get_summary_for_user() if hasattr(memory, "get_summary_for_user") else "", "diagnostics": diagnostics, "clarify": clarify}
 
 def format_clarification_for_ui(user_message: str, memory_summary: str = "", diagnostics: dict = None, max_preview_chars: int = 240):
@@ -1138,15 +823,13 @@ def format_clarification_for_ui(user_message: str, memory_summary: str = "", dia
         "quick_replies": quick_replies
     }
 
-# Clarification payload helper and optional Flask endpoint
-from flask import Flask, request, jsonify  # optional; only needed if you enable the endpoint
+from flask import Flask, request, jsonify
 
 def get_clarification_payload(user_message: str, memory_summary: str = "", diagnostics: dict = None):
     """
     Return a JSON-serializable dict with the clarification prompt and UI metadata.
     Use this from your frontend or call it inside your notebook.
     """
-    # render the clarification prompt using prompt_mgr
     body = prompt_mgr.render_clarify_user(
     original_query=user_message,
     memory_summary=memory_summary,
@@ -1167,38 +850,16 @@ def get_clarification_payload(user_message: str, memory_summary: str = "", diagn
         "memory_summary": memory_summary or ""
     }
 
-# Optional: lightweight Flask endpoint for local testing
-# Uncomment and run this cell to start a local server (only in environments that allow Flask)
-# app = Flask(__name__)
-#
-# @app.route("/clarify", methods=["POST"])
-# def clarify_endpoint():
-#     payload = request.get_json(force=True)
-#     user_message = payload.get("user_message", "")
-#     diagnostics = payload.get("diagnostics", {})
-#     memory_summary = payload.get("memory_summary", "")
-#     return jsonify(get_clarification_payload(user_message, memory_summary=memory_summary, diagnostics=diagnostics))
-#
-# if __name__ == "__main__":
-#     app.run(port=8787, debug=True)
-
-# Prompt manager wrapper
-from langchain.prompts.chat import ChatPromptTemplate
 from typing import Dict
 
-# reuse the templates you already created: system_msg_template, human_default, human_clarify, chat_prompt_default
-# Build a ChatPromptTemplate for clarification variant too
 chat_prompt_clarify = ChatPromptTemplate.from_messages([system_msg_template, human_clarify])
 
 class PromptManager:
     def __init__(self, default_prompt: ChatPromptTemplate, clarify_prompt: ChatPromptTemplate,
                  system_template: SystemMessagePromptTemplate = None, templates_yaml: dict = None):
-        # store the LangChain prompt objects you already created
         self.default = default_prompt
         self.clarify = clarify_prompt
-        # explicit system template object (fallback to the one used to build chat prompts)
         self.system_template = system_template
-        # raw YAML dict for optional clarify_user template
         self.templates = templates_yaml or {}
 
     def render_system(self, **kwargs) -> str:
@@ -1211,12 +872,10 @@ class PromptManager:
                 pv = self.system_template.format_prompt(**kwargs)
                 msgs = pv.to_messages()
                 return msgs[0].content if msgs else ""
-            # fallback: try the default ChatPromptTemplate's system message if present
             pv = system_msg_template.format_prompt(**kwargs)
             msgs = pv.to_messages()
             return msgs[0].content if msgs else ""
         except Exception:
-            # fail-safe short system prompt
             return "You are a concise, patient physics tutor for high-school and early-college students."
 
     def render_user(self, user_message: str, clarify: bool = False) -> str:
@@ -1233,7 +892,6 @@ class PromptManager:
                 return user_message
 
             content = msgs[-1].content or ""
-            # If LangChain didn't substitute, replace common placeholders
             if "{user_message}" in content or "{input}" in content or "{text}" in content or "{query}" in content:
                 content = content.replace("{user_message}", user_message)
                 content = content.replace("{input}", user_message)
@@ -1258,7 +916,6 @@ class PromptManager:
         except Exception:
             pass
 
-        # Fallback user-facing clarification
         return (
             f'Could you clarify what you mean by "{original_query}"?\n'
             "- electrical resistance in circuits (Ohm’s law)\n"
@@ -1267,151 +924,87 @@ class PromptManager:
             "Please choose one or add a brief detail."
         )
 
-# instantiate and expose
-# when you create the PromptManager, pass the system template and raw YAML if available
 prompt_mgr = PromptManager(
     default_prompt=chat_prompt_default,
     clarify_prompt=chat_prompt_clarify,
     system_template=system_msg_template,
-    templates_yaml=raw  # the YAML dict you loaded earlier
+    templates_yaml=raw
 )
 print("✅ PromptManager ready")
 
-ans, raw, src = generate_answer("What is resistance in current electricity?", history=[], memory_summary="", diagnostics={}, clarify=False)
-print("MODEL MESSAGES (should show the real question under user)")
-print("Answer snippet:", (ans or "")[:400])
+def build_messages(user_message, history, memory_summary, pdf_context, clarify=False):
+    messages = [{"role": "system", "content": prompt_mgr.render_system()}]
 
-# default preference: "nemo" or "openai"
-GENERATOR_PREFERENCE = "nemo"  # change to "openai" to prefer OpenAI
+    for turn in history[-6:]:
+        if len(turn) >= 1:
+            messages.append({"role": "user", "content": str(turn[0])})
+        if len(turn) >= 2:
+            messages.append({"role": "assistant", "content": str(turn[1])})
+
+    if pdf_context or memory_summary:
+        ctx = []
+        if pdf_context:
+            ctx.append("PDF context:\n" + pdf_context)
+        if memory_summary:
+            ctx.append("Memory summary:\n" + memory_summary)
+        messages.append({"role": "system", "content": "\n\n---\n".join(ctx)})
+
+    user_text = prompt_mgr.render_user(user_message, clarify=clarify)
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+def call_generator(messages, prefer_generator=None):
+    gen = (prefer_generator or GENERATOR_PREFERENCE).lower()
+    if gen == "nemo":
+        raw = nemo_rails.generate(messages=messages)
+        return _extract_text_from_reply(raw), raw, "nemo"
+
+    resp = openai.ChatCompletion.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.0
+    )
+    return resp["choices"][0]["message"]["content"], resp, "openai"
+
+GENERATOR_PREFERENCE = "nemo"
 OPENAI_MODEL = "gpt-3.5-turbo"
 
 def generate_answer(
-    user_message: str,
-    memory_summary: str = "",
-    diagnostics: dict = None,
-    clarify: bool = False,
+    user_message,
+    memory_summary="",
+    diagnostics=None,
+    clarify=False,
     history=None,
-    pdf_context: str = "",
-    prefer_generator: str = None
+    pdf_context="",
+    prefer_generator=None
 ):
-    """
-    Build messages with: system, recent history (assistant/user alternating),
-    optional RAG/memory context (as a single system augmentation),
-    then the current user turn. Call the selected generator and extract assistant text.
-    Returns (assistant_text, raw_reply, source) or ("", raw_reply, source) on error.
-    """
     history = history or []
     diagnostics = diagnostics or {}
-    source = None
 
-    # 1) Render system text
-    try:
-        system_text = prompt_mgr.render_system()
-    except Exception:
-        system_text = "You are a concise, patient physics tutor for high-school and early-college students."
+    messages = build_messages(
+        user_message=user_message,
+        history=history,
+        memory_summary=memory_summary,
+        pdf_context=pdf_context,
+        clarify=clarify
+    )
 
-    messages = [{"role": "system", "content": system_text.strip()}]
+    answer, raw, source = call_generator(messages, prefer_generator)
 
-    # 2) Include last N exchanges from history (sanitize)
-    try:
-        for turn in history[-6:]:
-            if isinstance(turn, (list, tuple)):
-                if len(turn) >= 1 and turn[0]:
-                    u = str(turn[0]).strip()
-                    if u:
-                        messages.append({"role": "user", "content": u})
-                if len(turn) >= 2 and turn[1]:
-                    a = str(turn[1]).strip()
-                    if a:
-                        messages.append({"role": "assistant", "content": a})
-    except Exception:
-        pass
-
-    # 3) Attach RAG/memory as a single system augmentation
-    context_blocks = []
-    if pdf_context and pdf_context.strip():
-        context_blocks.append("PDF context:\n" + pdf_context.strip())
-    if memory_summary and memory_summary.strip():
-        context_blocks.append("Memory summary:\n" + memory_summary.strip())
-
-    if context_blocks:
+    if answer.strip().lower().startswith(("hi", "hello", "hey")):
         messages.append({
-            "role": "system",
-            "content": "\n\n---\n" + "\n\n---\n".join(context_blocks)
-        })
-
-    # 4) Render user text once (no second .format)
-    try:
-        user_text = prompt_mgr.render_user(user_message=user_message, clarify=clarify)
-    except Exception:
-        user_text = user_message
-
-    messages.append({"role": "user", "content": (user_text or user_message).strip()})
-
-    # Optional debug (uncomment while testing)
-    print("=== MODEL MESSAGES ===")
-    for m in messages:
-        print(m.get("role"), ":", (m.get("content") or "")[:800])
-    print("======================")
-
-    # 5) Call generator (robust preference)
-    try:
-        gen_pref_raw = prefer_generator if isinstance(prefer_generator, str) else GENERATOR_PREFERENCE
-        gen_pref = (gen_pref_raw or "nemo").strip().lower()
-
-        if gen_pref == "nemo":
-            raw_reply = nemo_rails.generate(messages=messages)
-            assistant_text = _extract_text_from_reply(raw_reply)
-            source = "nemo"
-        else:
-            resp = openai.ChatCompletion.create(model=OPENAI_MODEL, messages=messages)
-            assistant_text = resp["choices"][0]["message"]["content"]
-            raw_reply = resp
-            source = "openai"
-    except Exception as e:
-        return "", {"error": str(e)}, None
-
-    # 6) Retry once if greeting-like reply
-    def _is_greeting(text: str) -> bool:
-        t = (text or "").strip().lower()
-        prefixes = ("hello", "hi", "hey", "how can i", "how may i", "greetings")
-        return any(t.startswith(p) for p in prefixes)
-
-    if assistant_text and _is_greeting(assistant_text):
-        retry_messages = list(messages)
-        retry_messages.append({
             "role": "user",
-            "content": (user_text or user_message).strip() + "\n\nPlease answer the user's question directly."
+            "content": user_message + "\n\nPlease answer directly."
         })
-        try:
-            if gen_pref == "nemo":
-                raw_retry = nemo_rails.generate(messages=retry_messages)
-                assistant_text_retry = _extract_text_from_reply(raw_retry)
-                if assistant_text_retry and not _is_greeting(assistant_text_retry):
-                    return assistant_text_retry, raw_retry, source
-            else:
-                resp2 = openai.ChatCompletion.create(model=OPENAI_MODEL, messages=retry_messages)
-                assistant_text_retry = resp2["choices"][0]["message"]["content"]
-                if assistant_text_retry and not _is_greeting(assistant_text_retry):
-                    return assistant_text_retry, resp2, source
-        except Exception:
-            pass
+        answer, raw, _ = call_generator(messages, prefer_generator)
 
-    return assistant_text or "", raw_reply, source
+    return answer or "", raw, source
 
 ans, raw, src = generate_answer("Explain electrical resistance briefly and give one circuit example.", history=[], memory_summary="", diagnostics={}, clarify=False)
 print("Source:", src)
 print("Answer snippet:", (ans or "")[:800])
 
-history = []
-history.append(["What is resistance in current electricity?", gradio_adapter("What is resistance in current electricity?", history)])
-history.append(["What is resistivity in current electricity?", gradio_adapter("What is resistivity in current electricity?", history)])
-print("History before compare:", history)
-print("Compare reply:", gradio_adapter("Compare the two as per current electricity.", history))
-
-# Run this right after you send the first question (and again after the second)
-q = "What is resistance in current electricity?"   # change to the exact first/second question
-# Call generate_answer with debug printing enabled (it prints MODEL MESSAGES)
+q = "What is resistance in current electricity?"
 ans, raw, src = generate_answer(q, history=[], memory_summary="", diagnostics={}, clarify=False)
 print("=== ANSWER ===")
 print("Source:", src)
@@ -1419,13 +1012,8 @@ print("Answer snippet:", (ans or "")[:400])
 print("=== RAW REPLY ===")
 print(raw)
 
-# Add near where you created system_msg_template and chat_prompt_default
-from langchain.prompts.chat import ChatPromptTemplate
-
-# create a ChatPromptTemplate that contains only the system message
 system_chat = ChatPromptTemplate.from_messages([system_msg_template])
 
-# OpenAI generator helper
 import openai
 
 def answer_query_with_openai(user_message: str, memory_summary: str = "", diagnostics: dict = None, clarify: bool = False):
@@ -1453,21 +1041,6 @@ def answer_query_with_openai(user_message: str, memory_summary: str = "", diagno
         return assistant_text, resp
     except Exception as e:
         return f"Error generating response via OpenAI: {e}", {"error": str(e)}
-
-test_query = "resistance?"
-ok, payload = vet_query(test_query)
-print("vet ok:", ok)
-if ok and payload.get("clarify"):
-    clarif_payload = get_clarification_payload(test_query, memory_summary=payload.get("memory_summary",""), diagnostics=payload.get("diagnostics",{}))
-    print("Clarification preview:", clarif_payload["preview"])
-    # simulate user selecting a quick reply or editing the body; here we use the first quick reply
-    user_confirmed_text = clarif_payload["quick_replies"][0]
-    print("Simulating user confirmation:", user_confirmed_text)
-    final = accept_clarification_and_generate(user_confirmed_text, original_user_message=test_query,
-                                              diagnostics=payload.get("diagnostics",{}), memory_summary=payload.get("memory_summary",""))
-    print("Final answer (snippet):", (final["answer"] or "")[:400])
-else:
-    print("No clarification required; full answer path or blocked.")
 
 @traceable_function
 def clear_memory():
@@ -1557,19 +1130,16 @@ def get_langsmith_status():
         return "⚠️ LangSmith Tracing: NOT AVAILABLE"
 
 def load_pdf_and_chat(pdf_file, message, history):
-    # First store the PDF
     result_msg = store_pdf_in_db(pdf_file.name)
-
-    # Then get response
     response = handle_user_message(message, history)
 
     return result_msg, response
 
-_pending_clarify = {}  # maps history_key -> { original_query, diagnostics, memory_summary }
+_pending_clarify = {}
 
 def _history_key(history):
     try:
-        return str(history[-6:])  # stable short key per session
+        return str(history[-6:])
     except Exception:
         return repr(history)
 
@@ -1577,7 +1147,6 @@ def _is_substantive_answer(text: str, min_len: int = 30) -> bool:
     if not text:
         return False
     t = text.strip().lower()
-    # treat short greetings or canned tutor messages as non-substantive
     if len(t) < min_len:
         return False
     for prefix in ("hello", "hi", "hey", "i'm here to help", "feel free to ask"):
@@ -1601,7 +1170,6 @@ def gradio_adapter(message, history):
     global _pending_clarify
     key = _history_key(history)
 
-    # 1) If pending clarification exists, treat this message as confirmation
     if key in _pending_clarify:
         pending = _pending_clarify.pop(key)
         final = accept_clarification_and_generate(
@@ -1612,23 +1180,18 @@ def gradio_adapter(message, history):
             history=history
         )
         answer = final.get("answer") or ""
-        # Only append substantive answers to history
         if _is_substantive_answer(answer):
             history.append([message, answer])
         return answer or "No answer generated."
 
-    # 2) Normal path: call handle_user_message and pass history
     result = handle_user_message(message, history=history)
 
-    # Ensure result is a dict
     if not isinstance(result, dict):
-        # fallback: return string
         reply = str(result)
         if _is_substantive_answer(reply):
             history.append([message, reply])
         return reply
 
-    # 3) Clarify requested: store pending clarify and return UI payload
     if result.get("clarify"):
         _pending_clarify[key] = {
             "original_query": message,
@@ -1636,19 +1199,12 @@ def gradio_adapter(message, history):
             "memory_summary": result.get("memory_summary", "")
         }
         payload = result.get("clarification_payload", {})
-        # Return the user-facing clarification body (or preview)
         return payload.get("body") or payload.get("preview") or "Could you clarify?"
 
-    # 4) Normal answer path
     answer = result.get("answer") or _extract_text_from_reply(result.get("raw_reply"))
     raw = result.get("raw_reply")
 
     return answer or "I didn’t catch that clearly. Could you rephrase or be more specific?"
-
-history = []
-gradio_adapter("What is resistance", history)
-#gradio_adapter("What is resistivity in current electricity?", history)
-#print("Follow-up (ambiguous):", gradio_adapter("give me their dimensions.", history))
 
 def launch_app():
     with gr.Blocks() as demo:
@@ -1765,20 +1321,21 @@ if __name__ == "__main__":
 
     launch_app()
 
+gradio_adapter("What is resistance?", [])
+gradio_adapter("What is resistance in current electricity?", [])
+gradio_adapter("Compare resistance and resistivity.", [])
+
 def _debug_handle_user_message(user_message):
     print("=== DEBUG handle_user_message start ===")
     print("user_message:", repr(user_message))
 
-    # RAG check
     pdf_context = get_relevant_context(user_message, n_results=3)
     print("pdf_context (len):", len(pdf_context))
     print("is_pdf_context_relevant:", is_pdf_context_relevant(pdf_context, user_message))
 
-    # vet_query
     ok, payload = vet_query(user_message)
     print("vet_query -> ok:", ok, "payload:", payload)
 
-    # If vet_query says clarify False, call generator here and print result
     if ok and not payload.get("clarify", False):
         print("Proceeding to generate_answer() now...")
         memory_summary = payload.get("memory_summary", "")
@@ -1793,25 +1350,5 @@ def _debug_handle_user_message(user_message):
     print("=== DEBUG handle_user_message end ===")
     return ok, payload
 
-# Run it
 _debug_handle_user_message("resistance?")
-
-# Direct generator test
-ans, raw, src = generate_answer("Explain electrical resistance briefly and give one circuit example.", memory_summary="", diagnostics={}, clarify=False)
-print("Answer snippet:", (ans or "")[:500])
-print("Source:", src)
-print("Raw reply type:", type(raw))
-
-# Temporary debug: print messages sent to the model
-print("=== MODEL MESSAGES ===")
-for m in messages:
-    role = m.get("role")
-    content = (m.get("content") or "")[:800]  # truncate
-    print(f"{role}: {content!r}")
-print("======================")
-
-print("Pending clarify map keys:", list(_pending_clarify.keys()))
-print("PDF context for 'resistance?':", repr(get_relevant_context("resistance?", n_results=3)))
-print("is_pdf_context_relevant:", is_pdf_context_relevant(get_relevant_context("resistance?", n_results=3), "resistance?"))
-print("vet_query('resistance?'):", vet_query("resistance?"))
 
